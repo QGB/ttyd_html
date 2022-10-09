@@ -3,7 +3,7 @@ const { merge } = require('webpack-merge');
 const CopyWebpackPlugin = require('copy-webpack-plugin');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 const MiniCssExtractPlugin = require("mini-css-extract-plugin");
-const CssMinimizerPlugin = require('css-minimizer-webpack-plugin');
+const OptimizeCSSAssetsPlugin = require("optimize-css-assets-webpack-plugin");
 const TerserPlugin = require('terser-webpack-plugin');
 
 const devMode = process.env.NODE_ENV !== 'production';
@@ -15,7 +15,7 @@ const baseConfig = {
     },
     output: {
         path: path.resolve(__dirname, 'dist'),
-        filename: devMode ? '[name].js' : '[name].[contenthash].js',
+        filename: devMode ? '[name].js' : '[name].[hash].js',
     },
     module: {
         rules: [
@@ -37,15 +37,6 @@ const baseConfig = {
                     'sass-loader',
                 ],
             },
-            {
-                test: /xterm-addon-image-worker/,
-                type: 'asset/inline',
-                generator: {
-                    dataUrl: content => {
-                        return content.toString();
-                    }
-                }
-            },
         ]
     },
     resolve: {
@@ -58,8 +49,8 @@ const baseConfig = {
             ],
         }),
         new MiniCssExtractPlugin({
-            filename: devMode ? '[name].css' : '[name].[contenthash].css',
-            chunkFilename: devMode ? '[id].css' : '[id].[contenthash].css',
+            filename: devMode ? '[name].css' : '[name].[hash].css',
+            chunkFilename: devMode ? '[id].css' : '[id].[hash].css',
         }),
         new HtmlWebpackPlugin({
             inject: false,
@@ -67,7 +58,7 @@ const baseConfig = {
                 removeComments: true,
                 collapseWhitespace: true,
             },
-            title: 'ttyd - Terminal',
+            title: 'Wi-Se - Terminal',
             template: './template.html'
         })
     ],
@@ -81,13 +72,10 @@ const devConfig =  {
     devServer: {
         contentBase: path.join(__dirname, 'dist'),
         compress: true,
-		host: '0.0.0.0',//qgb
         port: 9000,
         proxy: [{
             context: ['/token', '/ws'],
-            // target: 'http://192.168.1.6/',
-            // target: 'http://192.168.1.3:7681/',//Error occured while trying to proxy to: 192.168.1.10:9000/token
-            target: 'http://192.168.1.10:7681/',
+            target: 'http://localhost:7681',
             ws: true
         }]
     },
@@ -98,8 +86,17 @@ const prodConfig = {
     mode: 'production',
     optimization: {
         minimizer: [
-            new TerserPlugin(),
-            new CssMinimizerPlugin(),
+            new TerserPlugin({
+                sourceMap: true
+            }),
+            new OptimizeCSSAssetsPlugin({
+                cssProcessorOptions: {
+                    map: {
+                        inline: false,
+                        annotation: true
+                    }
+                }
+            }),
         ]
     },
     devtool: 'source-map',

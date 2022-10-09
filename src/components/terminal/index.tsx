@@ -1,17 +1,15 @@
 import { bind } from 'decko';
+import * as backoff from 'backoff';
 import { Component, h } from 'preact';
-import { ITerminalOptions, RendererType, Terminal } from 'xterm';
+import { ITerminalOptions, Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import { WebglAddon } from 'xterm-addon-webgl';
 import { WebLinksAddon } from 'xterm-addon-web-links';
-import { ImageAddon } from 'xterm-addon-image';
+
 import { OverlayAddon } from './overlay';
 import { ZmodemAddon, FlowControl } from '../zmodem';
 
 import 'xterm/css/xterm.css';
-import worker from 'xterm-addon-image/lib/xterm-addon-image-worker';
-
-const imageWorkerUrl = window.URL.createObjectURL(new Blob([worker], { type: 'text/javascript' }));
 
 interface TtydTerminal extends Terminal {
     fit(): void;
@@ -60,17 +58,18 @@ export class Xterm extends Component<Props> {
     private fitAddon: FitAddon;
     private overlayAddon: OverlayAddon;
     private zmodemAddon: ZmodemAddon;
-    private webglAddon: WebglAddon;
 
     private socket: WebSocket;
     private token: string;
-    private opened = false;
     private title: string;
     private titleFixed: string;
     private resizeTimeout: number;
     private resizeOverlay = true;
-    private reconnect = true;
-    private doReconnect = true;
+
+    private backoff: backoff.Backoff;
+    private backoffLock = false;
+    private doBackoff = true;
+    private reconnect = false;
 
     constructor(props: Props) {
         super(props);
@@ -79,6 +78,22 @@ export class Xterm extends Component<Props> {
         this.textDecoder = new TextDecoder();
         this.fitAddon = new FitAddon();
         this.overlayAddon = new OverlayAddon();
+        this.backoff = backoff.exponential({
+            initialDelay: 100,
+            maxDelay: 10000,
+        });
+        this.backoff.failAfter(15);
+        this.backoff.on('ready', () => {
+            this.backoffLock = false;
+            this.refreshToken().then(this.connect);
+        });
+        this.backoff.on('backoff', (_, delay: number) => {
+            console.log(`[ttyd] will attempt to reconnect websocket in ${delay}ms`);
+            this.backoffLock = true;
+        });
+        this.backoff.on('fail', () => {
+            this.backoffLock = true; // break backoff
+        });
     }
 
     async componentDidMount() {
@@ -179,7 +194,6 @@ export class Xterm extends Component<Props> {
         terminal.loadAddon(overlayAddon);
         terminal.loadAddon(new WebLinksAddon());
         terminal.loadAddon(this.zmodemAddon);
-        terminal.loadAddon(new ImageAddon(imageWorkerUrl));
 
         terminal.onTitleChange(data => {
             if (data && data !== '' && !this.titleFixed) {
@@ -196,7 +210,6 @@ export class Xterm extends Component<Props> {
             });
         }
         terminal.open(container);
-        fitAddon.fit();
     }
 
     @bind
@@ -212,51 +225,25 @@ export class Xterm extends Component<Props> {
     }
 
     @bind
-    private setRendererType(value: 'webgl' | RendererType) {
-        const { terminal } = this;
-
-        const disposeWebglRenderer = () => {
-            try {
-                this.webglAddon?.dispose();
-            } catch {
-                // ignore
-            }
-            this.webglAddon = undefined;
-        };
-
-        switch (value) {
-            case 'webgl':
-                if (this.webglAddon) return;
-                try {
-                    if (window.WebGL2RenderingContext && document.createElement('canvas').getContext('webgl2')) {
-                        this.webglAddon = new WebglAddon();
-                        this.webglAddon.onContextLoss(() => {
-                            disposeWebglRenderer();
-                        });
-                        terminal.loadAddon(this.webglAddon);
-                        console.log(`[ttyd] WebGL renderer enabled`);
-                    }
-                } catch (e) {
-                    console.warn(`[ttyd] webgl2 init error`, e);
-                }
-                break;
-            default:
-                disposeWebglRenderer();
-                console.log(`[ttyd] option: rendererType=${value}`);
-                terminal.options.rendererType = value;
-                break;
-        }
-    }
-
-    @bind
     private applyOptions(options: any) {
         const { terminal, fitAddon } = this;
+        const isWebGL2Available = () => {
+            try {
+                const canvas = document.createElement('canvas');
+                return !!(window.WebGL2RenderingContext && canvas.getContext('webgl2'));
+            } catch (e) {
+                return false;
+            }
+        };
 
         Object.keys(options).forEach(key => {
             const value = options[key];
             switch (key) {
                 case 'rendererType':
-                    this.setRendererType(value);
+                    if (value === 'webgl' && isWebGL2Available()) {
+                        terminal.loadAddon(new WebglAddon());
+                        console.log(`[ttyd] WebGL renderer enabled`);
+                    }
                     break;
                 case 'disableLeaveAlert':
                     if (value) {
@@ -273,7 +260,7 @@ export class Xterm extends Component<Props> {
                 case 'disableReconnect':
                     if (value) {
                         console.log(`[ttyd] Reconnect disabled`);
-                        this.reconnect = false;
+                        this.doBackoff = false;
                     }
                     break;
                 case 'titleFixed':
@@ -283,12 +270,8 @@ export class Xterm extends Component<Props> {
                     document.title = value;
                     break;
                 default:
-                    console.log(`[ttyd] option: ${key}=${JSON.stringify(value)}`);
-                    if (terminal.options[key] instanceof Object) {
-                        terminal.options[key] = Object.assign({}, terminal.options[key], value);
-                    } else {
-                        terminal.options[key] = value;
-                    }
+                    console.log(`[ttyd] option: ${key}=${value}`);
+                    terminal.setOption(key, value);
                     if (key.indexOf('font') === 0) fitAddon.fit();
                     break;
             }
@@ -298,28 +281,23 @@ export class Xterm extends Component<Props> {
     @bind
     private onSocketOpen() {
         console.log('[ttyd] websocket connection opened');
+        this.backoff.reset();
 
         const { socket, textEncoder, terminal, fitAddon, overlayAddon } = this;
-        const dims = fitAddon.proposeDimensions();
-        socket.send(
-            textEncoder.encode(
-                JSON.stringify({
-                    AuthToken: this.token,
-                    columns: dims.cols,
-                    rows: dims.rows,
-                })
-            )
-        );
+        socket.send(textEncoder.encode(JSON.stringify({ AuthToken: this.token })));
 
-        if (this.opened) {
+        if (this.reconnect) {
+            const dims = fitAddon.proposeDimensions();
             terminal.reset();
             terminal.resize(dims.cols, dims.rows);
+            this.onTerminalResize(dims); // may not be triggered by terminal.resize
             overlayAddon.showOverlay('Reconnected', 300);
         } else {
-            this.opened = true;
+            this.reconnect = true;
+            fitAddon.fit();
         }
 
-        this.doReconnect = this.reconnect;
+        this.applyOptions(this.props.clientOptions);
 
         terminal.focus();
     }
@@ -328,31 +306,22 @@ export class Xterm extends Component<Props> {
     private onSocketClose(event: CloseEvent) {
         console.log(`[ttyd] websocket connection closed with code: ${event.code}`);
 
-        const { refreshToken, connect, doReconnect, overlayAddon } = this;
+        const { backoff, doBackoff, backoffLock, overlayAddon } = this;
         overlayAddon.showOverlay('Connection Closed', null);
 
         // 1000: CLOSE_NORMAL
-        if (event.code !== 1000 && doReconnect) {
-            overlayAddon.showOverlay('Reconnecting...', null);
-            refreshToken().then(connect);
-        } else {
-            const { terminal } = this;
-            const keyDispose = terminal.onKey(e => {
-                const event = e.domEvent;
-                if (event.key === 'Enter') {
-                    keyDispose.dispose();
-                    overlayAddon.showOverlay('Reconnecting...', null);
-                    refreshToken().then(connect);
-                }
-            });
-            overlayAddon.showOverlay('Press ⏎ to Reconnect', null);
+        if (event.code !== 1000 && doBackoff && !backoffLock) {
+            backoff.backoff();
         }
     }
 
     @bind
     private onSocketError(event: Event) {
         console.error('[ttyd] websocket connection error: ', event);
-        this.doReconnect = false;
+        const { backoff, doBackoff, backoffLock } = this;
+        if (doBackoff && !backoffLock) {
+            backoff.backoff();
+        }
     }
 
     @bind
@@ -371,8 +340,7 @@ export class Xterm extends Component<Props> {
                 document.title = this.title;
                 break;
             case Command.SET_PREFERENCES:
-                const prefs = JSON.parse(textDecoder.decode(data));
-                this.applyOptions(Object.assign({}, this.props.clientOptions, prefs));
+                this.applyOptions(JSON.parse(textDecoder.decode(data)));
                 break;
             default:
                 console.warn(`[ttyd] unknown command: ${cmd}`);
@@ -383,11 +351,10 @@ export class Xterm extends Component<Props> {
     @bind
     private onTerminalResize(size: { cols: number; rows: number }) {
         const { overlayAddon, socket, textEncoder, resizeOverlay } = this;
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-
-        const msg = JSON.stringify({ columns: size.cols, rows: size.rows });
-        socket.send(textEncoder.encode(Command.RESIZE_TERMINAL + msg));
-
+        if (socket.readyState === WebSocket.OPEN) {
+            const msg = JSON.stringify({ columns: size.cols, rows: size.rows });
+            socket.send(textEncoder.encode(Command.RESIZE_TERMINAL + msg));
+        }
         if (resizeOverlay) {
             setTimeout(() => {
                 overlayAddon.showOverlay(`${size.cols}x${size.rows}`);
