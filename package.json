@@ -18,6 +18,8 @@
     "fix": "gts fix"
   },
   "devDependencies": {
+	"optimize-css-assets-webpack-plugin": "^5.0.4",  
+	  
     "copy-webpack-plugin": "^11.0.0",
     "css-loader": "^6.7.1",
     "css-minimizer-webpack-plugin": "^4.1.0",
@@ -46,6 +48,7 @@
     "webpack-merge": "^5.8.0"
   },
   "dependencies": {
+    "backoff": "^2.5.0",
     "decko": "^1.2.0",
     "file-saver": "^2.0.5",
     "preact": "^10.11.0",
